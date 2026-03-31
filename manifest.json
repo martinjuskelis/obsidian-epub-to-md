@@ -1,0 +1,9 @@
+{
+	"id": "epub-to-md",
+	"name": "EPUB to Markdown",
+	"version": "1.0.0",
+	"minAppVersion": "1.0.0",
+	"description": "Convert EPUB files to a folder of Markdown notes with images.",
+	"author": "Martin Juskelis",
+	"isDesktopOnly": false
+}
