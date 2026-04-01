@@ -321,6 +321,7 @@ function renderTocTree(
 		const key = entry.title.toLowerCase().trim();
 		const matches = lookup.get(key);
 
+		let rendered = false;
 		if (matches && matches.length > 0) {
 			// Consume first match for this title
 			const cf = matches.shift()!;
@@ -328,16 +329,24 @@ function renderTocTree(
 			lines.push(
 				`${indent}- [[${cf.filename}|${cf.displayName}]]`
 			);
+			rendered = true;
 		} else if (!entry.href) {
 			// Label-only entry (e.g., "Part I")
 			lines.push(
 				`${indent}- **${sanitizeWikilink(entry.title)}**`
 			);
+			rendered = true;
 		}
 
 		if (entry.children.length > 0) {
+			// Only indent children if this entry was actually rendered;
+			// otherwise keep same depth so children don't become orphaned
 			lines.push(
-				...renderTocTree(entry.children, lookup, depth + 1)
+				...renderTocTree(
+					entry.children,
+					lookup,
+					rendered ? depth + 1 : depth
+				)
 			);
 		}
 	}

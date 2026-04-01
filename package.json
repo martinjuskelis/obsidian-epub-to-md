@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-epub-to-md",
-	"version": "2.0.2",
+	"version": "2.0.3",
 	"description": "Convert EPUB files to a folder of Markdown notes with images",
 	"main": "main.js",
 	"scripts": {
