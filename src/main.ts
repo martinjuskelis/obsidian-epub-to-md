@@ -121,6 +121,9 @@ export default class EpubToMdPlugin extends Plugin {
 
 		// Compute all chapter filenames first (needed for prev/next links)
 		const padWidth = Math.max(2, String(chapters.length).length);
+		const indexFilename = this.settings.numberChapters
+			? `${"0".repeat(padWidth)} - ${bookName}`
+			: bookName;
 		const chapterFiles: ChapterFileInfo[] = [];
 
 		for (let i = 0; i < chapters.length; i++) {
@@ -144,7 +147,7 @@ export default class EpubToMdPlugin extends Plugin {
 				lines.push(
 					`title: "${escapeFrontmatter(chapter.title)}"`
 				);
-				lines.push(`parent: "[[${bookName}]]"`);
+				lines.push(`parent: "[[${indexFilename}]]"`);
 				if (chapter.contentType !== "chapter") {
 					lines.push(`type: ${chapter.contentType}`);
 				}
@@ -257,7 +260,7 @@ export default class EpubToMdPlugin extends Plugin {
 		indexLines.push("");
 
 		await this.writeText(
-			joinPath(baseDir, `${bookName}.md`),
+			joinPath(baseDir, `${indexFilename}.md`),
 			indexLines.join("\n")
 		);
 	}
