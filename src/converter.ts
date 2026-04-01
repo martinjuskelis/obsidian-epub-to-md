@@ -23,6 +23,7 @@ export interface EpubConversionResult {
 
 export async function convertEpub(
 	data: ArrayBuffer,
+	assetsSubfolder: string,
 	onProgress?: (msg: string) => void
 ): Promise<EpubConversionResult> {
 	const report = onProgress ?? (() => {});
@@ -37,8 +38,10 @@ export async function convertEpub(
 
 	const parser = new DOMParser();
 	const containerDoc = parser.parseFromString(containerXml, "text/xml");
+	assertNoParseerror(containerDoc, "container.xml");
+
 	const rootfileEl = containerDoc.querySelector("rootfile");
-	const opfPath = rootfileEl?.getAttribute("full-path");
+	const opfPath = rootfileEl?.getAttribute("full-path")?.trim();
 	if (!opfPath) throw new Error("Invalid EPUB: no rootfile path found");
 
 	// 2. Parse OPF
@@ -46,6 +49,8 @@ export async function convertEpub(
 	if (!opfXml) throw new Error("Invalid EPUB: missing OPF file");
 
 	const opfDoc = parser.parseFromString(opfXml, "text/xml");
+	assertNoParseerror(opfDoc, "OPF");
+
 	const opfDir = opfPath.includes("/")
 		? opfPath.substring(0, opfPath.lastIndexOf("/") + 1)
 		: "";
@@ -55,13 +60,17 @@ export async function convertEpub(
 	report(`Converting: ${metadata.title || "Untitled"}`);
 
 	// 4. Build manifest map (id -> {href, mediaType})
+	// Decode URL-encoded hrefs so they match JSZip entry paths
 	const manifest = new Map<string, { href: string; mediaType: string }>();
 	const manifestEls = opfDoc.querySelectorAll("manifest > item");
 	for (const el of Array.from(manifestEls)) {
 		const id = el.getAttribute("id");
-		const href = el.getAttribute("href");
+		const rawHref = el.getAttribute("href");
 		const mediaType = el.getAttribute("media-type") || "";
-		if (id && href) manifest.set(id, { href, mediaType });
+		if (id && rawHref) {
+			const href = decodeURIComponent(rawHref);
+			manifest.set(id, { href, mediaType });
+		}
 	}
 
 	// 5. Get spine order
@@ -106,12 +115,12 @@ export async function convertEpub(
 		emDelimiter: "*",
 	});
 	turndown.use(gfm);
-
-	// Remove <style> and <script> tags
 	turndown.remove(["style", "script"]);
 
-	// 8. Convert each spine item
+	// 8. Convert each spine item, deduplicating chapter filenames
 	const chapters: EpubChapter[] = [];
+	const usedChapterNames = new Set<string>();
+
 	for (let i = 0; i < spine.length; i++) {
 		const itemRef = spine[i];
 		const item = manifest.get(itemRef);
@@ -136,10 +145,10 @@ export async function convertEpub(
 		for (const img of Array.from(imgs)) {
 			const src = img.getAttribute("src");
 			if (!src) continue;
-			const resolvedPath = resolvePath(chapterDir, src);
+			const resolvedPath = resolvePath(chapterDir, decodeURIComponent(src));
 			const imageInfo = imageMap.get(resolvedPath);
 			if (imageInfo) {
-				img.setAttribute("src", `assets/${imageInfo.outputName}`);
+				img.setAttribute("src", `${assetsSubfolder}/${imageInfo.outputName}`);
 			}
 		}
 
@@ -149,14 +158,13 @@ export async function convertEpub(
 			const href =
 				img.getAttribute("xlink:href") || img.getAttribute("href");
 			if (!href) continue;
-			const resolvedPath = resolvePath(chapterDir, href);
+			const resolvedPath = resolvePath(chapterDir, decodeURIComponent(href));
 			const imageInfo = imageMap.get(resolvedPath);
 			if (imageInfo) {
-				// Replace SVG image with a regular img for turndown
 				const replacement = doc.createElement("img");
 				replacement.setAttribute(
 					"src",
-					`assets/${imageInfo.outputName}`
+					`${assetsSubfolder}/${imageInfo.outputName}`
 				);
 				replacement.setAttribute("alt", "");
 				img.parentNode?.replaceChild(replacement, img);
@@ -174,7 +182,16 @@ export async function convertEpub(
 		// Skip empty chapters (e.g., blank pages)
 		if (markdown.trim().length === 0) continue;
 
-		chapters.push({ title, filename: sanitizeFilename(title), markdown });
+		// Deduplicate chapter filenames
+		let chapterName = sanitizeFilename(title);
+		if (usedChapterNames.has(chapterName.toLowerCase())) {
+			let suffix = 2;
+			while (usedChapterNames.has(`${chapterName} (${suffix})`.toLowerCase())) suffix++;
+			chapterName = `${chapterName} (${suffix})`;
+		}
+		usedChapterNames.add(chapterName.toLowerCase());
+
+		chapters.push({ title, filename: chapterName, markdown });
 	}
 
 	// 9. Extract image data
@@ -192,7 +209,6 @@ export async function convertEpub(
 
 function extractMetadata(opfDoc: Document): EpubMetadata {
 	const getText = (tag: string): string => {
-		// Try with namespace prefix and without
 		const el =
 			opfDoc.querySelector(`metadata > ${tag}`) ||
 			opfDoc.querySelector(`metadata > *|${tag}`) ||
@@ -208,40 +224,51 @@ function extractMetadata(opfDoc: Document): EpubMetadata {
 	};
 }
 
+function assertNoParseerror(doc: Document, label: string): void {
+	const err = doc.querySelector("parsererror");
+	if (err) {
+		throw new Error(`Invalid EPUB: malformed XML in ${label}`);
+	}
+}
+
 function resolvePath(base: string, relative: string): string {
-	if (!relative.startsWith(".")) {
-		// Absolute path within the EPUB
-		if (relative.startsWith("/")) return relative.substring(1);
-		return base + relative;
+	// Always normalize the combined path to handle .. segments
+	let parts: string[];
+	if (relative.startsWith("/")) {
+		parts = relative.substring(1).split("/");
+	} else {
+		parts = (base + relative).split("/");
 	}
 
-	const baseParts = base.split("/").filter(Boolean);
-	const relParts = relative.split("/");
-
-	for (const part of relParts) {
-		if (part === "..") {
-			baseParts.pop();
-		} else if (part !== ".") {
-			baseParts.push(part);
+	const resolved: string[] = [];
+	for (const part of parts) {
+		if (part === ".." && resolved.length > 0) {
+			resolved.pop();
+		} else if (part !== "." && part !== "") {
+			resolved.push(part);
 		}
 	}
 
-	return baseParts.join("/");
+	return resolved.join("/");
 }
 
 function sanitizeFilename(name: string): string {
-	return name
+	let clean = name
 		.replace(/[\\/:*?"<>|]/g, "")
+		.replace(/^\.*/, "") // strip leading dots
 		.replace(/\s+/g, " ")
 		.trim()
 		.substring(0, 100);
+	return clean || "Untitled";
 }
 
 async function readZipText(
 	zip: JSZip,
 	path: string
 ): Promise<string | null> {
-	const file = zip.file(path);
+	// Try exact path, then URL-decoded version
+	let file = zip.file(path);
+	if (!file) file = zip.file(decodeURIComponent(path));
 	if (!file) return null;
 	return file.async("string");
 }

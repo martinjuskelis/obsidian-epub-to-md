@@ -64,9 +64,11 @@ export default class EpubToMdPlugin extends Plugin {
 		try {
 			const data = await this.app.vault.readBinary(file);
 
-			const result = await convertEpub(data, (msg) => {
-				progressNotice.setMessage(msg);
-			});
+			const result = await convertEpub(
+				data,
+				this.settings.assetsSubfolder,
+				(msg) => progressNotice.setMessage(msg)
+			);
 
 			progressNotice.setMessage("Saving files...");
 			await this.saveResult(file, result);
@@ -101,12 +103,12 @@ export default class EpubToMdPlugin extends Plugin {
 			baseDir = joinPath(parentPath, bookName);
 		}
 
-		await this.ensureFolder(baseDir);
+		await this.ensureFolderRecursive(baseDir);
 
 		// Save images
 		const assetsDir = joinPath(baseDir, this.settings.assetsSubfolder);
 		if (images.size > 0) {
-			await this.ensureFolder(assetsDir);
+			await this.ensureFolderRecursive(assetsDir);
 			for (const [name, data] of images) {
 				const imgPath = joinPath(assetsDir, name);
 				await this.writeBinary(imgPath, data);
@@ -114,17 +116,19 @@ export default class EpubToMdPlugin extends Plugin {
 		}
 
 		// Save chapters
+		const padWidth = String(chapters.length).length < 2 ? 2 : String(chapters.length).length;
 		const chapterLinks: string[] = [];
 		for (let i = 0; i < chapters.length; i++) {
 			const chapter = chapters[i];
 			const prefix = this.settings.numberChapters
-				? `${String(i + 1).padStart(2, "0")} `
+				? `${String(i + 1).padStart(padWidth, "0")} `
 				: "";
 			const chapterFilename = `${prefix}${chapter.filename}.md`;
 			const chapterPath = joinPath(baseDir, chapterFilename);
 
 			await this.writeText(chapterPath, chapter.markdown);
-			chapterLinks.push(`${i + 1}. [[${chapterFilename.replace(".md", "")}|${chapter.title}]]`);
+			const displayName = sanitizeWikilink(chapter.title);
+			chapterLinks.push(`${i + 1}. [[${chapterFilename.replace(".md", "")}|${displayName}]]`);
 		}
 
 		// Save index note
@@ -146,7 +150,9 @@ export default class EpubToMdPlugin extends Plugin {
 			indexLines.push("");
 		}
 		if (metadata.description) {
-			indexLines.push(`> ${metadata.description}`);
+			// Prefix every line with > for proper blockquote
+			const descLines = metadata.description.split(/\r?\n/);
+			indexLines.push(...descLines.map((l) => `> ${l}`));
 			indexLines.push("");
 		}
 		indexLines.push("## Chapters");
@@ -158,11 +164,20 @@ export default class EpubToMdPlugin extends Plugin {
 		await this.writeText(indexPath, indexLines.join("\n"));
 	}
 
-	private async ensureFolder(path: string) {
+	private async ensureFolderRecursive(path: string) {
 		if (this.app.vault.getAbstractFileByPath(path) instanceof TFolder) {
 			return;
 		}
-		await this.app.vault.createFolder(path);
+		// Create parent folders first
+		const parts = path.split("/");
+		let current = "";
+		for (const part of parts) {
+			current = current ? `${current}/${part}` : part;
+			const existing = this.app.vault.getAbstractFileByPath(current);
+			if (existing instanceof TFolder) continue;
+			if (existing) continue; // a file occupies this path; skip
+			await this.app.vault.createFolder(current);
+		}
 	}
 
 	private async writeText(path: string, content: string) {
@@ -189,13 +204,23 @@ function joinPath(dir: string, name: string): string {
 }
 
 function sanitizeFolderName(name: string): string {
-	return name
+	let clean = name
 		.replace(/[\\/:*?"<>|]/g, "")
+		.replace(/^\.*/, "")
 		.replace(/\s+/g, " ")
 		.trim()
 		.substring(0, 100);
+	return clean || "Untitled";
+}
+
+function sanitizeWikilink(text: string): string {
+	return text.replace(/[|\[\]]/g, "");
 }
 
 function escapeFrontmatter(s: string): string {
-	return s.replace(/"/g, '\\"');
+	return s
+		.replace(/\\/g, "\\\\")
+		.replace(/"/g, '\\"')
+		.replace(/\n/g, "\\n")
+		.replace(/\r/g, "");
 }
