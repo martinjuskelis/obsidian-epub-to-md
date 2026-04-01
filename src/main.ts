@@ -4,7 +4,12 @@ import {
 	EpubToMdSettingTab,
 	type EpubToMdSettings,
 } from "./settings";
-import { convertEpub, type EpubConversionResult } from "./converter";
+import {
+	convertEpub,
+	type EpubChapter,
+	type EpubConversionResult,
+	type TocEntry,
+} from "./converter";
 
 export default class EpubToMdPlugin extends Plugin {
 	settings: EpubToMdSettings = DEFAULT_SETTINGS;
@@ -89,7 +94,7 @@ export default class EpubToMdPlugin extends Plugin {
 	}
 
 	private async saveResult(epubFile: TFile, result: EpubConversionResult) {
-		const { metadata, chapters, images } = result;
+		const { metadata, chapters, images, coverImage, tocTree } = result;
 		const bookName = sanitizeFolderName(
 			metadata.title || epubFile.basename
 		);
@@ -110,72 +115,167 @@ export default class EpubToMdPlugin extends Plugin {
 		if (images.size > 0) {
 			await this.ensureFolderRecursive(assetsDir);
 			for (const [name, data] of images) {
-				const imgPath = joinPath(assetsDir, name);
-				await this.writeBinary(imgPath, data);
+				await this.writeBinary(joinPath(assetsDir, name), data);
 			}
 		}
 
-		// Save chapters
-		const padWidth = String(chapters.length).length < 2 ? 2 : String(chapters.length).length;
-		const chapterLinks: string[] = [];
-		for (let i = 0; i < chapters.length; i++) {
-			const chapter = chapters[i];
-			const prefix = this.settings.numberChapters
-				? `${String(i + 1).padStart(padWidth, "0")} `
-				: "";
-			const chapterFilename = `${prefix}${chapter.filename}.md`;
-			const chapterPath = joinPath(baseDir, chapterFilename);
+		// Compute all chapter filenames first (needed for prev/next links)
+		const padWidth = Math.max(2, String(chapters.length).length);
+		const chapterFiles: ChapterFileInfo[] = [];
 
-			await this.writeText(chapterPath, chapter.markdown);
-			const displayName = sanitizeWikilink(chapter.title);
-			chapterLinks.push(`${i + 1}. [[${chapterFilename.replace(".md", "")}|${displayName}]]`);
+		for (let i = 0; i < chapters.length; i++) {
+			const ch = chapters[i];
+			const prefix = this.settings.numberChapters
+				? `${String(i + 1).padStart(padWidth, "0")} - `
+				: "";
+			const filename = `${prefix}${ch.filename}`;
+			const displayName = sanitizeWikilink(ch.title);
+			chapterFiles.push({ filename, displayName, chapter: ch });
 		}
 
-		// Save index note
+		// Save chapter files with frontmatter and navigation
+		for (let i = 0; i < chapterFiles.length; i++) {
+			const { filename, chapter } = chapterFiles[i];
+			const lines: string[] = [];
+
+			// Chapter frontmatter
+			if (this.settings.includeFrontmatter) {
+				lines.push("---");
+				lines.push(
+					`title: "${escapeFrontmatter(chapter.title)}"`
+				);
+				lines.push(`parent: "[[${bookName}]]"`);
+				if (chapter.contentType !== "chapter") {
+					lines.push(`type: ${chapter.contentType}`);
+				}
+				lines.push("---");
+				lines.push("");
+			}
+
+			lines.push(chapter.markdown);
+
+			// Navigation footer
+			const prev = i > 0 ? chapterFiles[i - 1] : null;
+			const next =
+				i < chapterFiles.length - 1 ? chapterFiles[i + 1] : null;
+			if (prev || next) {
+				lines.push("");
+				lines.push("---");
+				const parts: string[] = [];
+				if (prev)
+					parts.push(
+						`prev: [[${prev.filename}|${prev.displayName}]]`
+					);
+				if (next)
+					parts.push(
+						`next: [[${next.filename}|${next.displayName}]]`
+					);
+				lines.push(parts.join(" | "));
+			}
+
+			await this.writeText(
+				joinPath(baseDir, `${filename}.md`),
+				lines.join("\n")
+			);
+		}
+
+		// Build index note
 		const indexLines: string[] = [];
 
 		if (this.settings.includeFrontmatter) {
 			indexLines.push("---");
-			if (metadata.title) indexLines.push(`title: "${escapeFrontmatter(metadata.title)}"`);
-			if (metadata.author) indexLines.push(`author: "${escapeFrontmatter(metadata.author)}"`);
-			if (metadata.language) indexLines.push(`language: ${metadata.language}`);
+			if (metadata.title)
+				indexLines.push(
+					`title: "${escapeFrontmatter(metadata.title)}"`
+				);
+			if (metadata.author)
+				indexLines.push(
+					`author: "${escapeFrontmatter(metadata.author)}"`
+				);
+			if (metadata.language)
+				indexLines.push(`language: ${metadata.language}`);
+			indexLines.push("type: book");
 			indexLines.push("---");
 			indexLines.push("");
 		}
 
 		indexLines.push(`# ${metadata.title || epubFile.basename}`);
 		indexLines.push("");
+
 		if (metadata.author) {
 			indexLines.push(`**Author:** ${metadata.author}`);
 			indexLines.push("");
 		}
+
+		// Cover image embed
+		if (coverImage) {
+			indexLines.push(
+				`![[${this.settings.assetsSubfolder}/${coverImage}]]`
+			);
+			indexLines.push("");
+		}
+
 		if (metadata.description) {
-			// Prefix every line with > for proper blockquote
 			const descLines = metadata.description.split(/\r?\n/);
 			indexLines.push(...descLines.map((l) => `> ${l}`));
 			indexLines.push("");
 		}
-		indexLines.push("## Chapters");
-		indexLines.push("");
-		indexLines.push(...chapterLinks);
+
+		// Hierarchical table of contents
+		indexLines.push("## Table of Contents");
 		indexLines.push("");
 
-		const indexPath = joinPath(baseDir, `${bookName}.md`);
-		await this.writeText(indexPath, indexLines.join("\n"));
+		if (tocTree.length > 0) {
+			const titleLookup = new Map<string, ChapterFileInfo[]>();
+			for (const cf of chapterFiles) {
+				const key = cf.chapter.title.toLowerCase().trim();
+				if (!titleLookup.has(key)) titleLookup.set(key, []);
+				titleLookup.get(key)!.push(cf);
+			}
+
+			indexLines.push(
+				...renderTocTree(tocTree, titleLookup, 0)
+			);
+
+			// Append any chapters not matched by the TOC tree
+			for (const [, remaining] of titleLookup) {
+				for (const cf of remaining) {
+					indexLines.push(
+						`- [[${cf.filename}|${cf.displayName}]]`
+					);
+				}
+			}
+		} else {
+			// No TOC tree — flat list
+			for (const cf of chapterFiles) {
+				indexLines.push(
+					`- [[${cf.filename}|${cf.displayName}]]`
+				);
+			}
+		}
+
+		indexLines.push("");
+
+		await this.writeText(
+			joinPath(baseDir, `${bookName}.md`),
+			indexLines.join("\n")
+		);
 	}
 
 	private async ensureFolderRecursive(path: string) {
-		if (this.app.vault.getAbstractFileByPath(path) instanceof TFolder) {
+		if (
+			this.app.vault.getAbstractFileByPath(path) instanceof TFolder
+		) {
 			return;
 		}
-		// Create parent folders first
 		const parts = path.split("/");
 		let current = "";
 		for (const part of parts) {
 			current = current ? `${current}/${part}` : part;
-			const existing = this.app.vault.getAbstractFileByPath(current);
+			const existing =
+				this.app.vault.getAbstractFileByPath(current);
 			if (existing instanceof TFolder) continue;
-			if (existing) continue; // a file occupies this path; skip
+			if (existing) continue;
 			await this.app.vault.createFolder(current);
 		}
 	}
@@ -198,6 +298,50 @@ export default class EpubToMdPlugin extends Plugin {
 		}
 	}
 }
+
+// ─── Hierarchical TOC rendering ─────────────────────────────────────
+
+interface ChapterFileInfo {
+	filename: string;
+	displayName: string;
+	chapter: EpubChapter;
+}
+
+function renderTocTree(
+	entries: TocEntry[],
+	lookup: Map<string, ChapterFileInfo[]>,
+	depth: number
+): string[] {
+	const lines: string[] = [];
+	for (const entry of entries) {
+		const indent = "  ".repeat(depth);
+		const key = entry.title.toLowerCase().trim();
+		const matches = lookup.get(key);
+
+		if (matches && matches.length > 0) {
+			// Consume first match for this title
+			const cf = matches.shift()!;
+			if (matches.length === 0) lookup.delete(key);
+			lines.push(
+				`${indent}- [[${cf.filename}|${cf.displayName}]]`
+			);
+		} else if (!entry.href) {
+			// Label-only entry (e.g., "Part I")
+			lines.push(
+				`${indent}- **${sanitizeWikilink(entry.title)}**`
+			);
+		}
+
+		if (entry.children.length > 0) {
+			lines.push(
+				...renderTocTree(entry.children, lookup, depth + 1)
+			);
+		}
+	}
+	return lines;
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────
 
 function joinPath(dir: string, name: string): string {
 	return dir ? `${dir}/${name}` : name;
