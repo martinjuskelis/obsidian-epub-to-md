@@ -129,10 +129,26 @@ export async function convertEpub(
 	const tocTree = await parseToc(zip, opfDir, opfDoc, manifest, parser);
 	const tocByHref = buildTocIndex(tocTree);
 
-	// 8. Identify nav document to skip in spine
-	const navIds = new Set<string>();
+	// 8. Identify documents to skip in spine (nav, TOC pages, cover pages)
+	const skipIds = new Set<string>();
 	for (const [id, item] of manifest) {
-		if (item.properties.split(/\s+/).includes("nav")) navIds.add(id);
+		if (item.properties.split(/\s+/).includes("nav")) skipIds.add(id);
+	}
+	// EPUB 2 guide: skip TOC and cover references
+	const guideSkipHrefs = new Set<string>();
+	for (const ref of Array.from(opfDoc.querySelectorAll("guide > reference"))) {
+		const type = (ref.getAttribute("type") || "").toLowerCase();
+		if (type === "toc" || type === "cover") {
+			const rawHref = ref.getAttribute("href");
+			if (rawHref) {
+				const { file } = splitHref(decodeURIComponent(rawHref));
+				guideSkipHrefs.add(file);
+			}
+		}
+	}
+	// Map guide hrefs to manifest IDs for skipping
+	for (const [id, item] of manifest) {
+		if (guideSkipHrefs.has(item.href)) skipIds.add(id);
 	}
 
 	// 9. Collect images
@@ -147,7 +163,7 @@ export async function convertEpub(
 
 	for (let i = 0; i < spine.length; i++) {
 		const idref = spine[i];
-		if (navIds.has(idref)) continue;
+		if (skipIds.has(idref)) continue;
 		const item = manifest.get(idref);
 		if (!item) continue;
 
@@ -165,6 +181,10 @@ export async function convertEpub(
 		if (!body) continue;
 
 		const bodyTypes = getEpubTypes(body);
+
+		// Skip pages that are TOC or cover by epub:type
+		if (bodyTypes.includes("toc") || bodyTypes.includes("cover")) continue;
+
 		rewriteImages(body, chapterDir, imageMap, assetsSubfolder);
 
 		const tocEntries = tocByHref.get(item.href) || [];
