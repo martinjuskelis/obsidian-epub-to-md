@@ -154,10 +154,14 @@ export async function convertEpub(
 	// 9. Collect images
 	const imageMap = collectImages(manifest, opfDir);
 
-	// 10. Turndown with footnote rules
+	// 10. Parse CSS for class-to-style mapping
+	report("Analyzing stylesheets...");
+	const cssMap = await buildCssClassMap(zip, opfDir, manifest);
+
+	// 11. Turndown with footnote rules
 	const turndown = createTurndownService();
 
-	// 11. Convert spine items
+	// 12. Convert spine items
 	const chapters: EpubChapter[] = [];
 	const usedNames = new Set<string>();
 
@@ -186,6 +190,7 @@ export async function convertEpub(
 		if (bodyTypes.includes("toc") || bodyTypes.includes("cover")) continue;
 
 		rewriteImages(body, chapterDir, imageMap, assetsSubfolder);
+		preprocessHtml(body, cssMap);
 
 		const tocEntries = tocByHref.get(item.href) || [];
 		const fragmentEntries = tocEntries.filter((e) => e.fragment);
@@ -429,6 +434,213 @@ function rewriteImages(
 			img.parentNode?.replaceChild(replacement, img);
 		}
 	}
+}
+
+// ─── CSS parsing & HTML preprocessing ───────────────────────────────
+
+interface CssStyles {
+	fontStyle?: string;
+	fontWeight?: string;
+	textDecoration?: string;
+	fontVariant?: string;
+}
+
+async function buildCssClassMap(
+	zip: JSZip,
+	opfDir: string,
+	manifest: Map<string, ManifestItem>
+): Promise<Map<string, CssStyles>> {
+	const map = new Map<string, CssStyles>();
+	for (const [, item] of manifest) {
+		if (item.mediaType !== "text/css") continue;
+		const css = await readZipText(zip, opfDir + item.href);
+		if (!css) continue;
+		// Parse simple rules: .className { property: value; }
+		// Handles compound selectors by extracting class names
+		const ruleRe = /([^{}]+)\{([^}]*)\}/g;
+		let m;
+		while ((m = ruleRe.exec(css)) !== null) {
+			const selector = m[1];
+			const body = m[2];
+			// Extract all class names from the selector
+			const classRe = /\.([a-zA-Z_][\w-]*)/g;
+			let cm;
+			const styles: CssStyles = {};
+			const declRe = /([\w-]+)\s*:\s*([^;!]+)/g;
+			let dm;
+			while ((dm = declRe.exec(body)) !== null) {
+				const prop = dm[1].trim().toLowerCase();
+				const val = dm[2].trim().toLowerCase();
+				if (prop === "font-style") styles.fontStyle = val;
+				if (prop === "font-weight") styles.fontWeight = val;
+				if (prop === "text-decoration") styles.textDecoration = val;
+				if (prop === "font-variant") styles.fontVariant = val;
+			}
+			if (!styles.fontStyle && !styles.fontWeight && !styles.textDecoration) continue;
+			while ((cm = classRe.exec(selector)) !== null) {
+				const cls = cm[1];
+				// Merge: later rules override earlier ones (CSS cascade)
+				const existing = map.get(cls) || {};
+				map.set(cls, { ...existing, ...styles });
+			}
+		}
+	}
+	return map;
+}
+
+// Well-known class names for formatting (fallback when CSS isn't available)
+const ITALIC_CLASSES = new Set([
+	"i", "italic", "emphasis", "em", "ital",
+]);
+const BOLD_CLASSES = new Set([
+	"b", "bold", "strong", "bld",
+]);
+const BOLD_ITALIC_CLASSES = new Set([
+	"bi", "ib", "bold-italic", "bolditalic",
+]);
+const STRIKE_CLASSES = new Set([
+	"st", "strike", "strikethrough", "line-through", "del",
+]);
+const BLOCKQUOTE_CLASSES = new Set([
+	"blockquote", "quote", "epigraph", "pullquote", "extract", "quotation",
+]);
+
+function isItalic(
+	classList: Set<string>,
+	inlineStyle: string,
+	cssMap: Map<string, CssStyles>
+): boolean {
+	if (/font-style\s*:\s*italic/i.test(inlineStyle)) return true;
+	for (const cls of classList) {
+		if (ITALIC_CLASSES.has(cls)) return true;
+		const s = cssMap.get(cls);
+		if (s?.fontStyle === "italic") return true;
+	}
+	return false;
+}
+
+function isBold(
+	classList: Set<string>,
+	inlineStyle: string,
+	cssMap: Map<string, CssStyles>
+): boolean {
+	if (/font-weight\s*:\s*(bold|[6-9]\d\d)/i.test(inlineStyle)) return true;
+	for (const cls of classList) {
+		if (BOLD_CLASSES.has(cls)) return true;
+		const s = cssMap.get(cls);
+		if (s?.fontWeight === "bold" || /^[6-9]\d\d$/.test(s?.fontWeight || ""))
+			return true;
+	}
+	return false;
+}
+
+function isBoldItalic(classList: Set<string>): boolean {
+	for (const cls of classList) {
+		if (BOLD_ITALIC_CLASSES.has(cls)) return true;
+	}
+	return false;
+}
+
+function isStrikethrough(
+	classList: Set<string>,
+	inlineStyle: string,
+	cssMap: Map<string, CssStyles>
+): boolean {
+	if (/text-decoration\s*:[^;]*line-through/i.test(inlineStyle)) return true;
+	for (const cls of classList) {
+		if (STRIKE_CLASSES.has(cls)) return true;
+		const s = cssMap.get(cls);
+		if (s?.textDecoration?.includes("line-through")) return true;
+	}
+	return false;
+}
+
+function isBlockquoteEl(classList: Set<string>): boolean {
+	for (const cls of classList) {
+		if (BLOCKQUOTE_CLASSES.has(cls)) return true;
+	}
+	return false;
+}
+
+function preprocessHtml(
+	body: Element,
+	cssMap: Map<string, CssStyles>
+): void {
+	// Process bottom-up so nested elements are handled before their parents
+	const elements = Array.from(body.querySelectorAll("*")).reverse();
+	const doc = body.ownerDocument;
+
+	for (const el of elements) {
+		// Skip elements inside pre/code (preserve formatting)
+		if (el.closest("pre, code")) continue;
+		// Don't touch elements with epub:type (handled by Turndown rules)
+		if (
+			el.getAttribute("epub:type") ||
+			el.getAttributeNS("http://www.idpf.org/2007/ops", "type")
+		)
+			continue;
+
+		const tag = el.localName;
+		const classList = new Set(
+			(el.getAttribute("class") || "").split(/\s+/).filter(Boolean)
+		);
+		const style = el.getAttribute("style") || "";
+
+		if (tag === "span") {
+			const bi =
+				isBoldItalic(classList) ||
+				(isBold(classList, style, cssMap) &&
+					isItalic(classList, style, cssMap));
+			if (bi) {
+				wrapWith(doc, el, "strong", "em");
+			} else if (isBold(classList, style, cssMap)) {
+				replaceTag(doc, el, "strong");
+			} else if (isItalic(classList, style, cssMap)) {
+				replaceTag(doc, el, "em");
+			} else if (isStrikethrough(classList, style, cssMap)) {
+				replaceTag(doc, el, "del");
+			} else if (!el.getAttribute("id")) {
+				// Unwrap non-semantic spans (no formatting, no ID anchor)
+				unwrapElement(el);
+			}
+		} else if (tag === "div" && isBlockquoteEl(classList)) {
+			replaceTag(doc, el, "blockquote");
+		}
+	}
+
+	// Second pass: clean up anchor-only <a> elements (no href, just id)
+	for (const a of Array.from(body.querySelectorAll("a:not([href])"))) {
+		if (a.getAttribute("id") && a.childNodes.length === 0) {
+			// Empty anchor tag — remove it
+			a.parentNode?.removeChild(a);
+		}
+	}
+}
+
+function replaceTag(doc: Document, el: Element, newTag: string): void {
+	const replacement = doc.createElement(newTag);
+	while (el.firstChild) replacement.appendChild(el.firstChild);
+	el.parentNode?.replaceChild(replacement, el);
+}
+
+function wrapWith(
+	doc: Document,
+	el: Element,
+	outerTag: string,
+	innerTag: string
+): void {
+	const outer = doc.createElement(outerTag);
+	const inner = doc.createElement(innerTag);
+	while (el.firstChild) inner.appendChild(el.firstChild);
+	outer.appendChild(inner);
+	el.parentNode?.replaceChild(outer, el);
+}
+
+function unwrapElement(el: Element): void {
+	const parent = el.parentNode;
+	if (!parent) return;
+	while (el.firstChild) parent.insertBefore(el.firstChild, el);
+	parent.removeChild(el);
 }
 
 // ─── TOC parsing ────────────────────────────────────────────────────
